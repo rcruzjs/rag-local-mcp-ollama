@@ -1,0 +1,30 @@
+# Ambientes virtuais
+.venv/
+venv/
+gpu_env/
+ENV/
+
+# Bytecode e Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Banco Vetorial e Dados Locais
+chroma_db/
+cadernos/*
+!cadernos/.gitkeep
+!cadernos/exemplo_nota.md
+
+# Configurações de Ambiente e Segredos
+.env
+.env.local
+
+# IDEs e Editores
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log

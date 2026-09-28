@@ -6,7 +6,7 @@ Servidor MCP para RAG sobre cadernos locais (estilo NotebookLM).
 Expõe tools para:
 - Consulta semântica em documentos (Markdown, TXT e PDF)
 - Métricas da base vetorial
-- Reindexação forçada
+- Reindexação forçada com ingestão incremental em lote (batching)
 
 Usa ChromaDB + embeddings via Ollama (nomic-embed-text por padrão).
 """
@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import glob
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,6 +46,7 @@ class Settings(BaseSettings):
     min_score: float = 0.30
     top_k_default: int = 3
     nome_collection: str = "cadernos_conhecimento"
+    batch_size: int = 32
 
 
 settings = Settings()
@@ -88,16 +88,18 @@ class SyncResult:
 # Utilitários de chunking e extração
 # ---------------------------------------------------------------------------
 
-def chunk_com_overlap(
+def chunk_recursivo(
     texto: str,
-    chunk_size: int = 500,
-    overlap: int = 100,
+    chunk_size: int = 300,
+    overlap: int = 60,
 ) -> list[str]:
-    """Divide o texto em chunks com sobreposição baseada em palavras.
+    """Divide o texto recursivamente utilizando separadores sintáticos hierárquicos.
+
+    Preserva a estrutura de parágrafos, frases e palavras.
 
     Args:
         texto: Texto completo a ser fragmentado.
-        chunk_size: Número aproximado de palavras por chunk.
+        chunk_size: Número máximo aproximado de palavras por chunk.
         overlap: Número de palavras de sobreposição entre chunks consecutivos.
 
     Returns:
@@ -113,24 +115,54 @@ def chunk_com_overlap(
     if chunk_size <= overlap:
         raise ValueError("chunk_size deve ser maior que overlap")
 
-    palavras = texto.split()
-    if not palavras:
+    texto_limpo = texto.strip()
+    if not texto_limpo:
         return []
 
+    separadores = ["\n\n", "\n", ". ", " "]
+
+    def dividir_texto(t: str, idx_sep: int) -> list[str]:
+        if not t.strip():
+            return []
+        palavras = t.split()
+        if len(palavras) <= chunk_size or idx_sep >= len(separadores):
+            return [t.strip()]
+
+        sep = separadores[idx_sep]
+        partes = t.split(sep)
+        segmentos: list[str] = []
+        for p in partes:
+            if p.strip():
+                segmentos.extend(dividir_texto(p.strip(), idx_sep + 1))
+        return segmentos
+
+    segmentos = dividir_texto(texto_limpo, 0)
     chunks: list[str] = []
-    inicio = 0
+    palavras_atuais: list[str] = []
 
-    while inicio < len(palavras):
-        fim = min(inicio + chunk_size, len(palavras))
-        trecho = " ".join(palavras[inicio:fim])
-        chunks.append(trecho)
+    for seg in segmentos:
+        words_seg = seg.split()
+        if len(palavras_atuais) + len(words_seg) <= chunk_size:
+            palavras_atuais.extend(words_seg)
+        else:
+            if palavras_atuais:
+                chunks.append(" ".join(palavras_atuais))
+                palavras_atuais = palavras_atuais[-overlap:] if overlap > 0 else []
+            palavras_atuais.extend(words_seg)
 
-        if fim >= len(palavras):
-            break
-
-        inicio += chunk_size - overlap
+    if palavras_atuais:
+        chunks.append(" ".join(palavras_atuais))
 
     return chunks
+
+
+def chunk_com_overlap(
+    texto: str,
+    chunk_size: int = 300,
+    overlap: int = 60,
+) -> list[str]:
+    """Função legada mantida para compatibilidade, utilizando chunk_recursivo."""
+    return chunk_recursivo(texto, chunk_size=chunk_size, overlap=overlap)
 
 
 def extrair_texto_arquivo(caminho: Path) -> list[DocumentPart]:
@@ -222,16 +254,17 @@ class VectorStore:
         metadados: list[dict[str, Any]],
         embeddings: list[list[float]],
     ) -> None:
-        """Adiciona novos chunks à coleção."""
+        """Adiciona um lote de chunks à base vetorial."""
         if not ids:
             return
+
         self._collection.add(
             ids=ids,
-            embeddings=embeddings,
             documents=documentos,
+            embeddings=embeddings,
             metadatas=metadados,
         )
-        logger.info("Adicionados %d novos chunks", len(ids))
+        logger.info("Adicionados %d novos chunks ao ChromaDB", len(ids))
 
     def query(
         self,
@@ -264,11 +297,11 @@ class VectorStore:
 
 
 # ---------------------------------------------------------------------------
-# Sincronização
+# Sincronização e Embeddings (com suporte a Batching)
 # ---------------------------------------------------------------------------
 
 def gerar_embedding(texto: str, modelo: str) -> list[float]:
-    """Gera embedding via Ollama.
+    """Gera embedding para um único texto via Ollama.
 
     Raises:
         RuntimeError: Se a chamada ao Ollama falhar.
@@ -277,12 +310,43 @@ def gerar_embedding(texto: str, modelo: str) -> list[float]:
         resposta = ollama.embeddings(model=modelo, prompt=texto)
         return resposta["embedding"]
     except Exception as exc:
-        logger.error("Falha ao gerar embedding: %s", exc)
+        logger.error("Falha ao gerar embedding individual: %s", exc)
         raise RuntimeError(f"Erro ao gerar embedding: {exc}") from exc
 
 
+def gerar_embeddings_batch(textos: list[str], modelo: str) -> list[list[float]]:
+    """Gera embeddings em lote via API do Ollama.
+
+    Args:
+        textos: Lista de textos para gerar embeddings.
+        modelo: Nome do modelo de embeddings.
+
+    Returns:
+        Lista de vetores (embeddings).
+
+    Raises:
+        RuntimeError: Se a chamada em lote falhar.
+    """
+    if not textos:
+        return []
+
+    try:
+        res = ollama.embed(model=modelo, input=textos)
+        vetores = res.get("embeddings") or getattr(res, "embeddings", None)
+        if vetores and len(vetores) == len(textos):
+            return list(vetores)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Falha na chamada batch ollama.embed (%s) — executando fallback individual", exc)
+
+    # Fallback sequencial se a API embed em lote falhar
+    vetores_fallback: list[list[float]] = []
+    for t in textos:
+        vetores_fallback.append(gerar_embedding(t, modelo))
+    return vetores_fallback
+
+
 def executar_sincronizacao(store: VectorStore, settings: Settings) -> SyncResult:
-    """Varre o diretório de cadernos e indexa apenas chunks novos.
+    """Varre o diretório de cadernos e indexa apenas chunks novos usando processamento em lote.
 
     Args:
         store: Instância do VectorStore.
@@ -312,10 +376,7 @@ def executar_sincronizacao(store: VectorStore, settings: Settings) -> SyncResult
         len(registros_existentes),
     )
 
-    novos_ids: list[str] = []
-    novos_documentos: list[str] = []
-    novos_metadados: list[dict[str, Any]] = []
-    novos_embeddings: list[list[float]] = []
+    pedacos_pendentes: list[tuple[str, str, dict[str, Any]]] = []
 
     for caminho in arquivos:
         try:
@@ -325,7 +386,7 @@ def executar_sincronizacao(store: VectorStore, settings: Settings) -> SyncResult
             continue
 
         for parte in partes:
-            pedacos = chunk_com_overlap(
+            pedacos = chunk_recursivo(
                 parte.texto,
                 chunk_size=settings.chunk_size,
                 overlap=settings.overlap,
@@ -333,26 +394,44 @@ def executar_sincronizacao(store: VectorStore, settings: Settings) -> SyncResult
 
             for idx, pedaco in enumerate(pedacos):
                 chunk_id = f"{parte.fonte}_p{parte.pagina}_chunk{idx}"
-
                 if chunk_id in registros_existentes:
                     continue
 
-                try:
-                    vetor = gerar_embedding(pedaco, settings.modelo_embedding)
-                except RuntimeError:
-                    logger.warning("Falha no embedding do chunk %s — pulando", chunk_id)
-                    continue
+                metadados = {
+                    "fonte": parte.fonte,
+                    "pagina": parte.pagina,
+                    "chunk": idx,
+                }
+                pedacos_pendentes.append((chunk_id, pedaco, metadados))
 
-                novos_ids.append(chunk_id)
-                novos_documentos.append(pedaco)
-                novos_metadados.append(
-                    {
-                        "fonte": parte.fonte,
-                        "pagina": parte.pagina,
-                        "chunk": idx,
-                    }
-                )
-                novos_embeddings.append(vetor)
+    if not pedacos_pendentes:
+        logger.info("Nenhum novo chunk para indexar.")
+        return SyncResult(novos=0, total=store.count(), arquivos=len(arquivos))
+
+    logger.info("Processando %d novos chunks em lotes de %d...", len(pedacos_pendentes), settings.batch_size)
+
+    novos_ids: list[str] = []
+    novos_documentos: list[str] = []
+    novos_metadados: list[dict[str, Any]] = []
+    novos_embeddings: list[list[float]] = []
+
+    batch_size = max(1, settings.batch_size)
+    for i in range(0, len(pedacos_pendentes), batch_size):
+        lote = pedacos_pendentes[i : i + batch_size]
+        lote_ids = [item[0] for item in lote]
+        lote_docs = [item[1] for item in lote]
+        lote_metas = [item[2] for item in lote]
+
+        try:
+            vetores = gerar_embeddings_batch(lote_docs, settings.modelo_embedding)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Erro ao gerar embeddings para lote %d-%d: %s", i, i + len(lote), exc)
+            continue
+
+        novos_ids.extend(lote_ids)
+        novos_documentos.extend(lote_docs)
+        novos_metadados.extend(lote_metas)
+        novos_embeddings.extend(vetores)
 
     if novos_ids:
         store.add_chunks(
@@ -475,7 +554,6 @@ def reindexar_cadernos() -> str:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Indexação inicial (opcional — pode ser removida se preferir apenas sob demanda)
     logger.info("Iniciando indexação inicial...")
     try:
         executar_sincronizacao(store, settings)

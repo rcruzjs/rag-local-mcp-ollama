@@ -215,8 +215,10 @@ async def chat_loop(settings: Settings) -> None:
     )
 
     try:
-        async with stdio_client(server_params) as (read, write):
-            async with ClientSession(read, write) as session:
+        async with (
+            stdio_client(server_params) as (read, write),
+            ClientSession(read, write) as session,
+        ):
                 await session.initialize()
                 logger.info("Sessão MCP inicializada com sucesso")
 
